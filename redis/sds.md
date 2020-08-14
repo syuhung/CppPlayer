@@ -15,7 +15,9 @@ sds是redis的基础数据结构之一,根据找到的信息来看，它有以�
 
 ## 1.基本保存结构
 
-redis提供了5种类型的sds,由5种不同结构体实现,分别用来存放不同大小的字符串。
+~~redis提供了5种类型的sds,由5种不同结构体实现,分别用来存放不同大小的字符串。~~
+
+根据后面的代码来看，这个理解并不对，应该说是提供了5种不同的header，sdshdr应该是simple dynamic strings header的意思。
 
 分别是sdshdr5、sdshdr8、sdshdr16、sdshdr32、sdshdr64。其中的sdshdr5是不使用的。
 
@@ -76,7 +78,7 @@ struct __attribute__ ((__packed__)) sdshdr64 {
     //buf中已占用空间的长度
     uint64_t len; 
 
-    //表示buf指针分配空间的大小
+    //注释说是去掉了header和空终止符(猜测是c字符串末尾的'\0')的部分
     uint64_t alloc; 
 
     //表示该字符串的类型(sdshdr5, sdshdr8, sdshdr16, sdshdr32, sdshdr64)
@@ -90,12 +92,12 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 紧接着结构定义的就是类型定义
 
 ```
-\#define SDS_TYPE_5  0
-\#define SDS_TYPE_8  1
-\#define SDS_TYPE_16 2
-\#define SDS_TYPE_32 3
-\#define SDS_TYPE_64 4
-\#define SDS_TYPE_MASK 7
+#define SDS_TYPE_5  0
+#define SDS_TYPE_8  1
+#define SDS_TYPE_16 2
+#define SDS_TYPE_32 3
+#define SDS_TYPE_64 4
+#define SDS_TYPE_MASK 7
 ```
 
 这里一共用了5个数字来定义sds的类型,1-5最多只用3bit就可以表示出来。所以这里还定义了一个SDS_TYPE_MASK,它的值为7,二进制表示为0111,只要将它与1-5
@@ -134,14 +136,34 @@ sds sdsnewlen(const void *init, size_t initlen);
 
 ```
 sds sdsnewlen(const void *init, size_t initlen) {
+	/* 先声明了一个空指针sh(从后面推测可能是sds header的意思)
+	s* 和一个sds类型变量s(也就是char\*，c类型字符串) */
+
     void *sh;
     sds s;
+
+    /* 定义了一个表示sds的5个类型的变量type，并调用[sdsReqType()](#sdsReqType)，
+     * 根据传入的字符串长度判断应该使用哪个类型的sds。 */
+
     char type = sdsReqType(initlen);
+
     /* Empty strings are usually created in order to append. Use type 8
      * since type 5 is not good at this. */
+
+    /* 接着往下走，因为sdshdr5已经启用，所以如果判断该使用sdshdr5，则换成sdshdr8
+     * 并且如果长度为0，也就是空字符串，也使用sdshdr8。 */
+
     if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
+
+    /* 根据type类型获得sdshdr的大小*/
+
     int hdrlen = sdsHdrSize(type);
+
+    /* 定义一个fp指针，后面可能用来表示sdshdr里的flag*/
+
     unsigned char *fp; /* flags pointer. */
+
+    /* s_malloc实际上就是z_malloc*/
 
     sh = s_malloc(hdrlen+initlen+1);
     if (sh == NULL) return NULL;
@@ -149,8 +171,15 @@ sds sdsnewlen(const void *init, size_t initlen) {
         init = NULL;
     else if (!init)
         memset(sh, 0, hdrlen+initlen+1);
+
+    /* s为sh往后偏移hdrlen的地址，也就是sdshdr开始的地址*/
     s = (char*)sh+hdrlen;
+
+    /* 因为flag是在sdshdr的最后面，所以此时fp指向了flag*/
     fp = ((unsigned char*)s)-1;
+
+    /* 根据sdshdr的类型调用SDS_HDR_VAR()，并将sdshdr里的len和alloc设置成initlen，也就是字符串的长度
+     * flag设置成sdshdr的类型*/
     switch(type) {
         case SDS_TYPE_5: {
             *fp = type | (initlen << SDS_TYPE_BITS);
@@ -185,12 +214,43 @@ sds sdsnewlen(const void *init, size_t initlen) {
             break;
         }
     }
+
+    /* 将init的字符复制到s里*/
     if (initlen && init)
         memcpy(s, init, initlen);
+
+    /* 为了兼容c字符串，末尾添加'\0*/
     s[initlen] = '\0';
+
+    /* 返回s*/
     return s;
 }
 ```
+构造函数分析完，对sds大概就有点印象了，redis的字符串s本质上就是char\*类型，但是它还带了一个header，也就是
+
+前面看到的sdshdr。为什么叫header，就是因为在内存中sdshdr是邻接在s前面，或者可以换个说法，s其实就是sdshdr最后面的
+
+柔性数组，这样就能保证了sds的可动态扩展的特性，并且同时既能存储任意的二进制数据也能与传统的c字符串兼容——只要末尾有个'\0'就可以了。
+
+~~下面用一张图来具体表示一下sds的内存结构,周五下班了暂时不写了~~
 
 
-从头文件的注释可以看出,sds
+## sdsReqType
+
+```
+static inline char sdsReqType(size_t string_size) {
+    if (string_size < 1<<5)
+        return SDS_TYPE_5;
+    if (string_size < 1<<8)
+        return SDS_TYPE_8;
+    if (string_size < 1<<16)
+        return SDS_TYPE_16;
+#if (LONG_MAX == LLONG_MAX)
+    if (string_size < 1ll<<32)
+        return SDS_TYPE_32;
+    return SDS_TYPE_64;
+#else
+    return SDS_TYPE_32;
+#endif
+}
+```
